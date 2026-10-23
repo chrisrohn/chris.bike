@@ -1,0 +1,88 @@
+# The Training app's sites, one workflow for both (.github/workflows/deploy.yml in each; this copy is its source):
+#
+#   chrisrohn/chris.bike          the app itself at https://chris.bike/ ([app] url in fitness/config.toml), with its CNAME
+#   chrisrohn/chrisrohn.github.io the old address: it forwards to chris.bike, carrying what each phone kept there along
+#                                 (fitness/site/move-out.js), but only once chris.bike answers with the app; until then
+#                                 it keeps serving the app itself ("standby"), so nobody is sent to an address not yet live
+#
+# `node fitness/build-app.mjs --role <this repository>` says which (app | standby | forward). Each run checks out
+# chrisrohn/chrisrohn (public: no token needed), builds that with `--as <role>`, and commits the result to this
+# repository's main branch, which Pages serves. Hourly it does that only when fitness/ or the role has changed since
+# the last deploy; "Run workflow" deploys any branch or commit at once.
+name: Deploy the Training app
+
+on:
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: chrisrohn/chrisrohn branch, tag or commit to build
+        default: main
+
+permissions:
+  contents: write   # the built site, committed to main
+  pages: write      # ask Pages to rebuild after the push
+  actions: write    # keep this schedule from being switched off after 60 quiet days
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: site
+      - uses: actions/checkout@v7
+        with:
+          repository: chrisrohn/chrisrohn
+          ref: ${{ inputs.ref || 'main' }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: What to build
+        id: src
+        run: |
+          cd src
+          if ! grep -q "export async function role" fitness/build-app.mjs; then
+            echo "This ref predates the move to chris.bike: nothing to deploy." && echo "skip=1" >> "$GITHUB_OUTPUT" && exit 0
+          fi
+          role="$(node fitness/build-app.mjs --role "$GITHUB_REPOSITORY")"
+          echo "This site: $role" && echo "role=$role" >> "$GITHUB_OUTPUT"
+          hash="$(git rev-parse HEAD:fitness)-$(git rev-parse HEAD:package.json)-$role"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(cat ../site/.source 2>/dev/null)" = "$hash" ]; then
+            echo "Unchanged since the last deploy." && echo "skip=1" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build
+        if: steps.src.outputs.skip != '1'
+        run: |
+          cd src
+          npm install --no-save --ignore-scripts --no-audit --no-fund "maplibre-gl@$(node -p "require('./package.json').devDependencies['maplibre-gl']")"
+          node fitness/build-app.mjs --as "${{ steps.src.outputs.role }}" ../out
+      - name: Publish
+        if: steps.src.outputs.skip != '1'
+        run: |
+          cd site
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github ! -name README.md -exec rm -rf {} +
+          cp -a ../out/. .
+          echo "${{ steps.src.outputs.hash }}" > .source
+          git add -A
+          if git diff --cached --quiet; then echo "No change."; exit 0; fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Deploy chrisrohn/chrisrohn@$(git -C ../src rev-parse --short HEAD) [${{ inputs.ref || 'main' }}] as ${{ steps.src.outputs.role }}"
+          git push -q
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pages/builds" >/dev/null 2>&1 || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Keep the schedule on
+        if: always()
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/enable" >/dev/null 2>&1 || true
+        env:
+          GH_TOKEN: ${{ github.token }}
